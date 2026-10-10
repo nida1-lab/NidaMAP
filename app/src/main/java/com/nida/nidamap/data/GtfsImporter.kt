@@ -137,7 +137,7 @@ object GtfsImporter {
             }
         }
         trips.values.map { it.serviceId }.distinct().forEach {
-            calendars.putIfAbsent(it, ServiceCalendar("1111111", "00000000", "99999999"))
+            calendars.putIfAbsent(it, ServiceCalendar("0000000", "00000000", "99999999"))
         }
 
         var datasetName = "インポートしたGTFSデータ"
@@ -230,6 +230,23 @@ object GtfsImporter {
                 throw IOException("stop_times.txt に有効な停車時刻がありません。")
             }
 
+            val terminalByTrip = mutableMapOf<String, Int>()
+            db.rawQuery(
+                """SELECT stop_times.trip_id, stop_times.arrival_seconds
+                   FROM gtfs_import_stop_times AS stop_times
+                   INNER JOIN (
+                       SELECT trip_id, MAX(stop_sequence) AS last_sequence
+                       FROM gtfs_import_stop_times GROUP BY trip_id
+                   ) AS last_stop
+                   ON stop_times.trip_id = last_stop.trip_id
+                      AND stop_times.stop_sequence = last_stop.last_sequence""".trimIndent(),
+                null
+            ).use { terminalCursor ->
+                while (terminalCursor.moveToNext()) {
+                    terminalByTrip[terminalCursor.getString(0)] = terminalCursor.getInt(1)
+                }
+            }
+
             val insertDeparture = db.compileStatement(
                 """INSERT INTO timetable
                    (station_id, line_name, destination, departure_time, arrival_time, service_days,
@@ -261,14 +278,14 @@ object GtfsImporter {
                         previous = null
                         continue
                     }
-                    val calendar = calendars[trip.serviceId] ?: ServiceCalendar("1111111", "00000000", "99999999")
+                    val calendar = calendars[trip.serviceId] ?: ServiceCalendar("0000000", "00000000", "99999999")
                     if (current.departureSeconds >= 0) {
                         insertDeparture.clearBindings()
                         insertDeparture.bindString(1, current.stationId)
                         insertDeparture.bindString(2, trip.lineName)
                         insertDeparture.bindString(3, trip.headsign)
                         insertDeparture.bindString(4, formatGtfsTime(current.departureSeconds))
-                        insertDeparture.bindString(5, formatGtfsTime(current.arrivalSeconds))
+                        insertDeparture.bindString(5, formatGtfsTime(terminalByTrip[tripId] ?: current.arrivalSeconds))
                         insertDeparture.bindString(6, serviceLabel(calendar))
                         insertDeparture.bindString(7, trip.serviceId)
                         insertDeparture.bindLong(8, current.departureSeconds.toLong())
