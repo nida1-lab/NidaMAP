@@ -115,6 +115,7 @@ private fun NidaMapApp() {
     var gpsEnabled by remember { mutableStateOf(false) }
     var gpsStatus by remember { mutableStateOf("乗車ガイドは停止中") }
     var motionDetected by remember { mutableStateOf(false) }
+    var motionDetected by remember { mutableStateOf(false) }
     var dataStatus by remember { mutableStateOf("データはこの端末内に保存されます。") }
     val scope = rememberCoroutineScope()
     var confirmReset by remember { mutableStateOf(false) }
@@ -210,6 +211,14 @@ private fun NidaMapApp() {
             selectedTab = 0
             return
         }
+        if (datasetInfo.isDemo) {
+            gpsEnabled = false
+            rideStarted = true
+            rideStep = 0
+            gpsStatus = "デモ座標でのGPS自動推定は無効です。手動ガイドを利用できます。"
+            selectedTab = 2
+            return
+        }
         val fineGranted = ContextCompat.checkSelfPermission(
             context, Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
@@ -230,7 +239,7 @@ private fun NidaMapApp() {
     }
 
     val route = searchResult
-    val trackingActive = rideStarted && selectedTab == 2 && gpsEnabled &&
+    val trackingActive = rideStarted && selectedTab == 2 && gpsEnabled && !datasetInfo.isDemo &&
         route != null && rideStep < route.stations.lastIndex
 
     @SuppressLint("MissingPermission")
@@ -304,6 +313,31 @@ private fun NidaMapApp() {
         }
     }
 
+    val motionTrackingActive = rideStarted && selectedTab == 2 && route != null && rideStep < route.stations.lastIndex
+    DisposableEffect(motionTrackingActive) {
+        val manager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val sensor = manager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                if (event.values.size >= 3) {
+                    val magnitude = sqrt(
+                        (event.values[0] * event.values[0] +
+                            event.values[1] * event.values[1] +
+                            event.values[2] * event.values[2]).toDouble()
+                    )
+                    motionDetected = magnitude > 0.75
+                }
+            }
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+        }
+        if (motionTrackingActive && sensor != null) {
+            manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        } else {
+            motionDetected = false
+        }
+        onDispose { manager.unregisterListener(listener) }
+    }
+
     val tabs = listOf("経路", "時刻表", "乗車中", "データ")
     Scaffold(
         topBar = {
@@ -374,6 +408,7 @@ private fun NidaMapApp() {
                     rideStarted = rideStarted,
                     currentStep = rideStep,
                     gpsStatus = gpsStatus,
+                    motionDetected = motionDetected,
                     onStart = { startRide() },
                     onNext = {
                         val max = searchResult?.stations?.lastIndex ?: 0
@@ -627,6 +662,7 @@ private fun RideScreen(
     rideStarted: Boolean,
     currentStep: Int,
     gpsStatus: String,
+    motionDetected: Boolean,
     onStart: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
@@ -653,6 +689,11 @@ private fun RideScreen(
                 trackColor = RailLineColor
             )
             Text(gpsStatus, color = if (gpsStatus.contains("利用できません") || gpsStatus.contains("ありません")) Color(0xFF9A5B00) else Muted)
+            Text(
+                if (motionDetected) "端末の動きを検知中（列車判定ではありません）" else "加速度センサー：大きな動きなし",
+                color = Muted,
+                style = MaterialTheme.typography.bodySmall
+            )
             if (rideStarted) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = onPrevious, enabled = boundedStep > 0, modifier = Modifier.weight(1f)) {
@@ -685,7 +726,7 @@ private fun RideScreen(
             }
         }
     }
-    InfoCard("地下区間について", "GPS精度が落ちた場合、自動で駅を確定できないことがあります。誤案内を防ぐため、［次の駅へ］で手動修正できます。現在の実装は駅座標への接近を使った簡易判定です。")
+    InfoCard("地下区間について", "GPS精度が落ちた場合、自動で駅を確定できないことがあります。加速度センサーは端末の動きを補助的に表示しますが、列車や駅を単独で判定しません。誤案内を防ぐため、［次の駅へ］で手動修正できます。")
 }
 
 @Composable
