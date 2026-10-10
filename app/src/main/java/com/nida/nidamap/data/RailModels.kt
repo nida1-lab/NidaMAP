@@ -12,7 +12,8 @@ data class RailConnection(
     val toStationId: String,
     val lineName: String,
     val minutes: Int,
-    val distanceMeters: Int? = null
+    val distanceMeters: Int? = null,
+    val routeId: String? = null
 )
 
 data class TimetableEntry(
@@ -35,8 +36,18 @@ data class RouteLeg(
     val to: Station,
     val lineName: String,
     val minutes: Int,
-    val transferMinutes: Int = 0
+    val transferMinutes: Int = 0,
+    val routeId: String? = null
 )
+
+data class FareEstimate(
+    val totalYen: Int,
+    val coveredSegments: Int,
+    val totalSegments: Int
+) {
+    val isComplete: Boolean
+        get() = totalSegments > 0 && coveredSegments == totalSegments
+}
 
 data class RouteResult(
     val stations: List<Station>,

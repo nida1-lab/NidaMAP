@@ -77,7 +77,8 @@ object RoutePlanner {
                             to = to,
                             lineName = connection.lineName,
                             minutes = connection.minutes,
-                            transferMinutes = transferPenalty
+                            transferMinutes = transferPenalty,
+                            routeId = connection.routeId
                         )
                     )
                     queue.add(QueueNode(nextKey, nextCost))

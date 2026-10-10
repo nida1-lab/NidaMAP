@@ -24,10 +24,26 @@ object GtfsImporter {
         val latitude: Double?,
         val longitude: Double?,
         val parent: String,
-        val locationType: Int
+        val locationType: Int,
+        val zoneId: String
     )
     private data class ServiceCalendar(val flags: String, val startDate: String, val endDate: String)
-    private data class TripInfo(val serviceId: String, val lineName: String, val headsign: String)
+    private data class TripInfo(val serviceId: String, val lineName: String, val headsign: String, val routeId: String)
+    private data class FareAttribute(
+        val fareId: String,
+        val price: Double,
+        val currencyType: String,
+        val paymentMethod: Int,
+        val transfers: String,
+        val transferDuration: Int?
+    )
+    private data class FareRule(
+        val fareId: String,
+        val routeId: String,
+        val originId: String,
+        val destinationId: String,
+        val containsId: String
+    )
     private data class StopTime(
         val tripId: String,
         val stationId: String,
@@ -62,7 +78,8 @@ object GtfsImporter {
                     latitude = row["stop_lat"]?.toDoubleOrNull(),
                     longitude = row["stop_lon"]?.toDoubleOrNull(),
                     parent = row["parent_station"].orEmpty().trim(),
-                    locationType = row["location_type"]?.toIntOrNull() ?: 0
+                    locationType = row["location_type"]?.toIntOrNull() ?: 0,
+                    zoneId = row["zone_id"].orEmpty().trim()
                 )
             }
         }
@@ -117,7 +134,8 @@ object GtfsImporter {
                 trips[tripId] = TripInfo(
                     serviceId = serviceId,
                     lineName = lineName,
-                    headsign = row["trip_headsign"].orEmpty().trim().ifBlank { lineName }
+                    headsign = row["trip_headsign"].orEmpty().trim().ifBlank { lineName },
+                    routeId = routeId
                 )
             }
         }
@@ -152,6 +170,24 @@ object GtfsImporter {
             }
         }
 
+        val fareAttributes = mutableListOf<FareAttribute>()
+        readCsv(zip, "fare_attributes.txt") { row ->
+            val fareId = row["fare_id"].orEmpty().trim()
+            val price = row["price"]?.toDoubleOrNull()
+            if (fareId.isNotBlank() && price != null && price >= 0.0 && price.isFinite()) {
+                fareAttributes += FareAttribute(fareId, price, row["currency_type"].orEmpty().trim(),
+                    row["payment_method"]?.toIntOrNull() ?: 0, row["transfers"].orEmpty().trim(),
+                    row["transfer_duration"]?.toIntOrNull())
+            }
+        }
+        val fareRules = mutableListOf<FareRule>()
+        readCsv(zip, "fare_rules.txt") { row ->
+            val fareId = row["fare_id"].orEmpty().trim()
+            if (fareId.isNotBlank()) fareRules += FareRule(fareId,
+                row["route_id"].orEmpty().trim(), row["origin_id"].orEmpty().trim(),
+                row["destination_id"].orEmpty().trim(), row["contains_id"].orEmpty().trim())
+        }
+
         val db = database.writableDatabase
         db.beginTransaction()
         try {
@@ -159,6 +195,9 @@ object GtfsImporter {
             db.delete("service_calendar", null, null)
             db.delete("service_exceptions", null, null)
             db.delete("gtfs_import_stop_times", null, null)
+            db.delete("fare_rules", null, null)
+            db.delete("fare_attributes", null, null)
+            db.delete("station_zones", null, null)
             db.delete("connections", null, null)
             db.delete("stations", null, null)
             db.delete("metadata", null, null)
@@ -171,6 +210,35 @@ object GtfsImporter {
                     if (station.longitude == null) putNull("longitude") else put("longitude", station.longitude)
                 }
                 db.insertOrThrow("stations", null, values)
+            }
+            rawStops.values.forEach { stop ->
+                val canonicalId = stopToStation[stop.id] ?: stop.id
+                val zone = stop.zoneId.ifBlank { rawStops[canonicalId]?.zoneId.orEmpty() }
+                if (canonicalId in stationsById && zone.isNotBlank()) {
+                    db.insertWithOnConflict("station_zones", null,
+                        ContentValues().apply { put("station_id", canonicalId); put("zone_id", zone) },
+                        SQLiteDatabase.CONFLICT_REPLACE)
+                }
+            }
+            fareAttributes.forEach { fare ->
+                db.insertWithOnConflict("fare_attributes", null, ContentValues().apply {
+                    put("fare_id", fare.fareId)
+                    put("price", fare.price)
+                    put("currency_type", fare.currencyType)
+                    put("payment_method", fare.paymentMethod)
+                    put("transfers", fare.transfers)
+                    if (fare.transferDuration == null) putNull("transfer_duration")
+                    else put("transfer_duration", fare.transferDuration)
+                }, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+            fareRules.forEach { rule ->
+                db.insert("fare_rules", null, ContentValues().apply {
+                    put("fare_id", rule.fareId)
+                    put("route_id", rule.routeId)
+                    put("origin_id", rule.originId)
+                    put("destination_id", rule.destinationId)
+                    put("contains_id", rule.containsId)
+                })
             }
             calendars.forEach { (id, calendar) ->
                 db.insertOrThrow(
@@ -301,7 +369,7 @@ object GtfsImporter {
                         if (durationSeconds in 1..14400) {
                             val minutes = ((durationSeconds + 59) / 60).coerceIn(1, 240)
                             val distance = distanceMeters(stationsById[prior.stationId], stationsById[current.stationId])
-                            upsertConnection(db, prior.stationId, current.stationId, trip.lineName, minutes, distance)
+                            upsertConnection(db, prior.stationId, current.stationId, trip.lineName, minutes, distance, trip.routeId)
                         }
                     }
                     previous = current
@@ -337,7 +405,8 @@ object GtfsImporter {
         to: String,
         line: String,
         minutes: Int,
-        distance: Int?
+        distance: Int?,
+        routeId: String
     ) {
         val values = ContentValues().apply {
             put("from_id", from)
@@ -345,6 +414,7 @@ object GtfsImporter {
             put("line_name", line)
             put("minutes", minutes)
             if (distance == null) putNull("distance_meters") else put("distance_meters", distance)
+            put("route_id", routeId)
         }
         db.insertWithOnConflict("connections", null, values, SQLiteDatabase.CONFLICT_IGNORE)
         val update = if (distance == null) {

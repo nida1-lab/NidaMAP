@@ -9,6 +9,15 @@ import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
+
+private data class FareRuleRecord(
+    val fareId: String,
+    val routeId: String,
+    val originId: String,
+    val destinationId: String,
+    val containsId: String
+)
 
 /**
  * Small SQLite store so stations, route connections and imported timetables stay on-device.
@@ -33,7 +42,8 @@ class RailDatabase(context: Context) :
                 to_id TEXT NOT NULL,
                 line_name TEXT NOT NULL,
                 minutes INTEGER NOT NULL,
-                distance_meters INTEGER
+                distance_meters INTEGER,
+                route_id TEXT NOT NULL DEFAULT ''
             )""".trimIndent()
         )
         db.execSQL(
@@ -56,8 +66,9 @@ class RailDatabase(context: Context) :
         db.execSQL("CREATE TABLE service_calendar (service_id TEXT PRIMARY KEY NOT NULL, weekday_flags TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL)")
         db.execSQL("CREATE TABLE service_exceptions (service_id TEXT NOT NULL, service_date TEXT NOT NULL, exception_type INTEGER NOT NULL, PRIMARY KEY(service_id, service_date))")
         db.execSQL("CREATE TABLE gtfs_import_stop_times (trip_id TEXT NOT NULL, stop_sequence INTEGER NOT NULL, station_id TEXT NOT NULL, arrival_seconds INTEGER NOT NULL, departure_seconds INTEGER NOT NULL)")
+        createFareTables(db)
         db.execSQL("CREATE INDEX idx_timetable_station_time ON timetable(station_id, departure_seconds)")
-        db.execSQL("CREATE UNIQUE INDEX idx_connection_key ON connections(from_id, to_id, line_name)")
+        db.execSQL("CREATE UNIQUE INDEX idx_connection_key ON connections(from_id, to_id, line_name, route_id)")
         seedDemo(db)
     }
 
@@ -75,6 +86,19 @@ class RailDatabase(context: Context) :
             db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_connection_key ON connections(from_id, to_id, line_name)")
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_timetable_station_time ON timetable(station_id, departure_seconds)")
         }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE connections ADD COLUMN route_id TEXT NOT NULL DEFAULT ''")
+            db.execSQL("DROP INDEX IF EXISTS idx_connection_key")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_connection_key ON connections(from_id, to_id, line_name, route_id)")
+            createFareTables(db)
+        }
+    }
+
+    private fun createFareTables(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS fare_attributes (fare_id TEXT PRIMARY KEY NOT NULL, price REAL NOT NULL, currency_type TEXT NOT NULL, payment_method INTEGER NOT NULL DEFAULT 0, transfers TEXT NOT NULL DEFAULT '', transfer_duration INTEGER)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS fare_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, fare_id TEXT NOT NULL, route_id TEXT NOT NULL DEFAULT '', origin_id TEXT NOT NULL DEFAULT '', destination_id TEXT NOT NULL DEFAULT '', contains_id TEXT NOT NULL DEFAULT '')")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_fare_rules_fare ON fare_rules(fare_id)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS station_zones (station_id TEXT PRIMARY KEY NOT NULL, zone_id TEXT NOT NULL)")
     }
 
     fun getStations(): List<Station> {
@@ -98,7 +122,7 @@ class RailDatabase(context: Context) :
     fun getConnections(): List<RailConnection> {
         val result = mutableListOf<RailConnection>()
         readableDatabase.rawQuery(
-            "SELECT from_id, to_id, line_name, minutes, distance_meters FROM connections ORDER BY id",
+            "SELECT from_id, to_id, line_name, minutes, distance_meters, route_id FROM connections ORDER BY id",
             null
         ).use { cursor ->
             while (cursor.moveToNext()) {
@@ -107,7 +131,8 @@ class RailDatabase(context: Context) :
                     toStationId = cursor.getString(1),
                     lineName = cursor.getString(2),
                     minutes = cursor.getInt(3),
-                    distanceMeters = if (cursor.isNull(4)) null else cursor.getInt(4)
+                    distanceMeters = if (cursor.isNull(4)) null else cursor.getInt(4),
+                    routeId = cursor.getString(5).takeIf { it.isNotBlank() }
                 )
             }
         }
@@ -234,7 +259,8 @@ class RailDatabase(context: Context) :
             val distance = if (item.has("distanceMeters") && !item.isNull("distanceMeters")) {
                 item.getInt("distanceMeters").also { require(it in 1..500000) { "距離が範囲外です。" } }
             } else null
-            connections += RailConnection(from, to, line, minutes, distance)
+            val routeId = item.optString("routeId").trim().takeIf { it.isNotBlank() }
+            connections += RailConnection(from, to, line, minutes, distance, routeId)
         }
         require(connections.isNotEmpty()) { "connections は1件以上必要です。" }
 
@@ -278,6 +304,9 @@ class RailDatabase(context: Context) :
             db.delete("service_calendar", null, null)
             db.delete("service_exceptions", null, null)
             db.delete("gtfs_import_stop_times", null, null)
+            db.delete("fare_rules", null, null)
+            db.delete("fare_attributes", null, null)
+            db.delete("station_zones", null, null)
             db.delete("connections", null, null)
             db.delete("stations", null, null)
             db.delete("metadata", null, null)
@@ -342,6 +371,7 @@ class RailDatabase(context: Context) :
                 .put("line", connection.lineName)
                 .put("minutes", connection.minutes)
             connection.distanceMeters?.let { item.put("distanceMeters", it) }
+            connection.routeId?.let { item.put("routeId", it) }
             connectionArray.put(item)
         }
         val timetableArray = JSONArray()
@@ -384,6 +414,70 @@ class RailDatabase(context: Context) :
         return root.toString(2)
     }
 
+    /**
+     * Computes a reference fare only where imported GTFS Fares V1 data contains matching
+     * JPY fare attributes and rules. Missing prices are never guessed.
+     */
+    fun estimateFare(route: RouteResult): FareEstimate? {
+        if (route.legs.isEmpty()) return null
+        val db = readableDatabase
+        val prices = linkedMapOf<String, Int>()
+        db.rawQuery("SELECT fare_id, price, currency_type FROM fare_attributes", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                val fareId = cursor.getString(0)
+                val currency = cursor.getString(2)
+                val price = cursor.getDouble(1)
+                if (currency.equals("JPY", ignoreCase = true) && price >= 0.0 && price.isFinite()) prices[fareId] = price.roundToInt()
+            }
+        }
+        if (prices.isEmpty()) return null
+        val rules = mutableListOf<FareRuleRecord>()
+        db.rawQuery("SELECT fare_id, route_id, origin_id, destination_id, contains_id FROM fare_rules", null).use { cursor ->
+            while (cursor.moveToNext()) rules += FareRuleRecord(cursor.getString(0), cursor.getString(1), cursor.getString(2), cursor.getString(3), cursor.getString(4))
+        }
+        if (rules.isEmpty()) return null
+        val zones = mutableMapOf<String, String>()
+        db.rawQuery("SELECT station_id, zone_id FROM station_zones", null).use { cursor ->
+            while (cursor.moveToNext()) zones[cursor.getString(0)] = cursor.getString(1)
+        }
+        val runs = mutableListOf<MutableList<RouteLeg>>()
+        route.legs.forEach { leg ->
+            val key = leg.routeId?.takeIf { it.isNotBlank() }?.let { "route:$it" } ?: "line:${leg.lineName}"
+            val previous = runs.lastOrNull()?.lastOrNull()
+            val previousKey = previous?.let {
+                it.routeId?.takeIf { id -> id.isNotBlank() }?.let { id -> "route:$id" } ?: "line:${it.lineName}"
+            }
+            if (previousKey != key || runs.isEmpty()) runs.add(mutableListOf())
+            runs.last().add(leg)
+        }
+        var totalYen = 0
+        var covered = 0
+        runs.forEach { run ->
+            val first = run.first()
+            val last = run.last()
+            val routeId = first.routeId.orEmpty()
+            val originZone = zones[first.from.id].orEmpty()
+            val destinationZone = zones[last.to.id].orEmpty()
+            val viaZones = (listOf(first.from) + run.map { it.to }).mapNotNull { zones[it.id] }.toSet()
+            val matches = rules.filter { rule ->
+                (rule.routeId.isBlank() || (routeId.isNotBlank() && rule.routeId == routeId)) &&
+                    (rule.originId.isBlank() || (originZone.isNotBlank() && rule.originId == originZone)) &&
+                    (rule.destinationId.isBlank() || (destinationZone.isNotBlank() && rule.destinationId == destinationZone)) &&
+                    (rule.containsId.isBlank() || rule.containsId in viaZones)
+            }
+            if (matches.isNotEmpty()) {
+                val scores = matches.associateWith { rule -> listOf(rule.routeId, rule.originId, rule.destinationId, rule.containsId).count { it.isNotBlank() } }
+                val bestScore = scores.values.maxOrNull() ?: 0
+                val price = matches.asSequence().filter { scores[it] == bestScore }.mapNotNull { prices[it.fareId] }.minOrNull()
+                if (price != null) {
+                    totalYen += price
+                    covered += 1
+                }
+            }
+        }
+        return if (covered == 0) null else FareEstimate(totalYen, covered, runs.size)
+    }
+
     fun resetToDemoData() {
         val db = writableDatabase
         db.beginTransaction()
@@ -392,6 +486,9 @@ class RailDatabase(context: Context) :
             db.delete("service_calendar", null, null)
             db.delete("service_exceptions", null, null)
             db.delete("gtfs_import_stop_times", null, null)
+            db.delete("fare_rules", null, null)
+            db.delete("fare_attributes", null, null)
+            db.delete("station_zones", null, null)
             db.delete("connections", null, null)
             db.delete("stations", null, null)
             db.delete("metadata", null, null)
@@ -525,6 +622,7 @@ class RailDatabase(context: Context) :
             put("minutes", connection.minutes)
             if (connection.distanceMeters == null) putNull("distance_meters")
             else put("distance_meters", connection.distanceMeters)
+            put("route_id", connection.routeId.orEmpty())
         }
         db.insertWithOnConflict("connections", null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
@@ -602,6 +700,6 @@ class RailDatabase(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "nidamap_offline.db"
-        private const val DATABASE_VERSION = 2
+        private const val DATABASE_VERSION = 3
     }
 }
