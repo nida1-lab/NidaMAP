@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -69,6 +70,12 @@ import com.nida.nidamap.data.RouteResult
 import com.nida.nidamap.data.Station
 import com.nida.nidamap.data.TimetableEntry
 import com.nida.nidamap.routing.RoutePlanner
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -114,6 +121,7 @@ private fun NidaMapApp() {
     var rideStep by remember { mutableIntStateOf(0) }
     var gpsEnabled by remember { mutableStateOf(false) }
     var gpsStatus by remember { mutableStateOf("乗車ガイドは停止中") }
+    var currentLocation by remember { mutableStateOf<Location?>(null) }
     var motionDetected by remember { mutableStateOf(false) }
     var dataStatus by remember { mutableStateOf("データはこの端末内に保存されます。") }
     val scope = rememberCoroutineScope()
@@ -127,6 +135,7 @@ private fun NidaMapApp() {
         rideStarted = false
         rideStep = 0
         gpsEnabled = false
+        currentLocation = null
         gpsStatus = "乗車ガイドは停止中"
     }
 
@@ -210,14 +219,6 @@ private fun NidaMapApp() {
             selectedTab = 0
             return
         }
-        if (datasetInfo.isDemo) {
-            gpsEnabled = false
-            rideStarted = true
-            rideStep = 0
-            gpsStatus = "デモ座標でのGPS自動推定は無効です。手動ガイドを利用できます。"
-            selectedTab = 2
-            return
-        }
         val fineGranted = ContextCompat.checkSelfPermission(
             context, Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
@@ -238,11 +239,11 @@ private fun NidaMapApp() {
     }
 
     val route = searchResult
-    val trackingActive = rideStarted && selectedTab == 2 && gpsEnabled && !datasetInfo.isDemo &&
+    val trackingActive = rideStarted && selectedTab == 2 && gpsEnabled &&
         route != null && rideStep < route.stations.lastIndex
 
     @SuppressLint("MissingPermission")
-    DisposableEffect(trackingActive, route, rideStep) {
+    DisposableEffect(trackingActive, route, rideStep, datasetInfo.isDemo) {
         if (trackingActive && route != null) {
             val target = route.stations.getOrNull(rideStep + 1)
             val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -250,7 +251,12 @@ private fun NidaMapApp() {
             var alreadyAdvanced = false
             val listener = object : LocationListener {
                 override fun onLocationChanged(location: Location) {
+                    currentLocation = Location(location)
                     gpsStatus = "GPS測位中（精度 約${location.accuracy.toInt()}m）"
+                    if (datasetInfo.isDemo) {
+                        gpsStatus = "現在地を表示中（デモデータでは駅の自動判定は無効）"
+                        return
+                    }
                     if (target?.latitude == null || target.longitude == null) return
                     if (location.accuracy > 80f || alreadyAdvanced) return
                     val distance = FloatArray(1)
@@ -404,6 +410,7 @@ private fun NidaMapApp() {
                 )
                 2 -> RideScreen(
                     route = searchResult,
+                    currentLocation = currentLocation,
                     rideStarted = rideStarted,
                     currentStep = rideStep,
                     gpsStatus = gpsStatus,
@@ -658,6 +665,7 @@ private fun TimetableScreen(
 @Composable
 private fun RideScreen(
     route: RouteResult?,
+    currentLocation: Location?,
     rideStarted: Boolean,
     currentStep: Int,
     gpsStatus: String,
@@ -674,6 +682,11 @@ private fun RideScreen(
     }
     val boundedStep = currentStep.coerceIn(0, route.stations.lastIndex)
     val current = route.stations[boundedStep]
+    RideMapView(
+        route = route,
+        currentStep = boundedStep,
+        currentLocation = currentLocation
+    )
     val next = route.stations.getOrNull(boundedStep + 1)
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -726,6 +739,131 @@ private fun RideScreen(
         }
     }
     InfoCard("地下区間について", "GPS精度が落ちた場合、自動で駅を確定できないことがあります。加速度センサーは端末の動きを補助的に表示しますが、列車や駅を単独で判定しません。誤案内を防ぐため、［次の駅へ］で手動修正できます。")
+}
+
+
+@Composable
+private fun RideMapView(
+    route: RouteResult,
+    currentStep: Int,
+    currentLocation: Location?
+) {
+    val context = LocalContext.current
+    val mapView = remember(context) {
+        Configuration.getInstance().userAgentValue = context.packageName
+        MapView(context).apply {
+            setTileSource(TileSourceFactory.MAPNIK)
+            setMultiTouchControls(true)
+            setBuiltInZoomControls(false)
+            controller.setZoom(13.5)
+        }
+    }
+    DisposableEffect(mapView) {
+        mapView.onResume()
+        onDispose {
+            mapView.onPause()
+            mapView.onDetach()
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color.White)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("現在地", color = Muted, style = MaterialTheme.typography.labelSmall)
+                    Text(
+                        currentLocation?.let { "取得済み · 精度 約${it.accuracy.toInt()}m" } ?: "位置情報を取得中…",
+                        color = Ink,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Column(horizontalAlignment = androidx.compose.ui.Alignment.End) {
+                    Text("目的地", color = Muted, style = MaterialTheme.typography.labelSmall)
+                    Text(route.stations.last().name, color = NidaGreen, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+        AndroidView(
+            factory = { mapView },
+            modifier = Modifier.fillMaxWidth().height(380.dp),
+            update = { map ->
+                map.overlays.removeAll { it is Marker || it is Polyline }
+                val stationPoints = route.stations.mapNotNull { station ->
+                    val lat = station.latitude
+                    val lon = station.longitude
+                    if (lat != null && lon != null && lat in -90.0..90.0 && lon in -180.0..180.0) {
+                        GeoPoint(lat, lon)
+                    } else null
+                }
+                if (stationPoints.size >= 2) {
+                    val routeLine = Polyline().apply {
+                        setPoints(stationPoints)
+                        outlinePaint.color = android.graphics.Color.rgb(0, 143, 98)
+                        outlinePaint.strokeWidth = 9f
+                    }
+                    map.overlays.add(routeLine)
+                }
+                route.stations.forEachIndexed { index, station ->
+                    val lat = station.latitude
+                    val lon = station.longitude
+                    if (lat != null && lon != null && lat in -90.0..90.0 && lon in -180.0..180.0) {
+                        val point = GeoPoint(lat, lon)
+                        val marker = Marker(map).apply {
+                            position = point
+                            title = station.name
+                            snippet = when (index) {
+                                0 -> "出発駅"
+                                route.stations.lastIndex -> "目的地"
+                                currentStep -> "現在の案内駅"
+                                else -> "経由駅"
+                            }
+                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                        }
+                        map.overlays.add(marker)
+                    }
+                }
+                currentLocation?.let { location ->
+                    val here = GeoPoint(location.latitude, location.longitude)
+                    map.overlays.add(Marker(map).apply {
+                        position = here
+                        title = "現在地"
+                        snippet = "GPS精度 約${location.accuracy.toInt()}m"
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    })
+                }
+                val center = currentLocation?.let { GeoPoint(it.latitude, it.longitude) }
+                    ?: route.stations.getOrNull(currentStep)?.let { station ->
+                        if (station.latitude != null && station.longitude != null) GeoPoint(station.latitude, station.longitude) else null
+                    }
+                    ?: stationPoints.firstOrNull()
+                    ?: GeoPoint(34.6937, 135.5023)
+                map.controller.setCenter(center)
+                map.controller.setZoom(if (currentLocation == null) 13.5 else 15.0)
+                map.invalidate()
+            }
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { mapView.controller.zoomOut() },
+                modifier = Modifier.weight(1f)
+            ) { Text("− 縮小") }
+            OutlinedButton(
+                onClick = { mapView.controller.zoomIn() },
+                modifier = Modifier.weight(1f)
+            ) { Text("+ 拡大") }
+        }
+        Text(
+            "地図：OpenStreetMap · 経路線は駅座標を結んだ概略表示です。地図タイルの初回表示には通信が必要です。",
+            color = Muted,
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
 }
 
 @Composable
