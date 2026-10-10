@@ -115,7 +115,6 @@ private fun NidaMapApp() {
     var gpsEnabled by remember { mutableStateOf(false) }
     var gpsStatus by remember { mutableStateOf("乗車ガイドは停止中") }
     var motionDetected by remember { mutableStateOf(false) }
-    var motionDetected by remember { mutableStateOf(false) }
     var dataStatus by remember { mutableStateOf("データはこの端末内に保存されます。") }
     val scope = rememberCoroutineScope()
     var confirmReset by remember { mutableStateOf(false) }
