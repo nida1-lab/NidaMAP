@@ -44,16 +44,36 @@ class RailDatabase(context: Context) :
                 destination TEXT NOT NULL,
                 departure_time TEXT NOT NULL,
                 arrival_time TEXT NOT NULL,
-                service_days TEXT NOT NULL
+                service_days TEXT NOT NULL,
+                service_id TEXT NOT NULL DEFAULT '',
+                departure_seconds INTEGER NOT NULL DEFAULT 0,
+                weekday_flags TEXT NOT NULL DEFAULT '1111111',
+                start_date TEXT NOT NULL DEFAULT '00000000',
+                end_date TEXT NOT NULL DEFAULT '99999999'
             )""".trimIndent()
         )
         db.execSQL("CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
+        db.execSQL("CREATE TABLE service_calendar (service_id TEXT PRIMARY KEY NOT NULL, weekday_flags TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL)")
+        db.execSQL("CREATE TABLE service_exceptions (service_id TEXT NOT NULL, service_date TEXT NOT NULL, exception_type INTEGER NOT NULL, PRIMARY KEY(service_id, service_date))")
+        db.execSQL("CREATE TABLE gtfs_import_stop_times (trip_id TEXT NOT NULL, stop_sequence INTEGER NOT NULL, station_id TEXT NOT NULL, arrival_seconds INTEGER NOT NULL, departure_seconds INTEGER NOT NULL)")
+        db.execSQL("CREATE INDEX idx_timetable_station_time ON timetable(station_id, departure_seconds)")
+        db.execSQL("CREATE UNIQUE INDEX idx_connection_key ON connections(from_id, to_id, line_name)")
         seedDemo(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion < 1) {
-            onCreate(db)
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE timetable ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE timetable ADD COLUMN departure_seconds INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE timetable ADD COLUMN weekday_flags TEXT NOT NULL DEFAULT '1111111'")
+            db.execSQL("ALTER TABLE timetable ADD COLUMN start_date TEXT NOT NULL DEFAULT '00000000'")
+            db.execSQL("ALTER TABLE timetable ADD COLUMN end_date TEXT NOT NULL DEFAULT '99999999'")
+            db.execSQL("CREATE TABLE IF NOT EXISTS service_calendar (service_id TEXT PRIMARY KEY NOT NULL, weekday_flags TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS service_exceptions (service_id TEXT NOT NULL, service_date TEXT NOT NULL, exception_type INTEGER NOT NULL, PRIMARY KEY(service_id, service_date))")
+            db.execSQL("CREATE TABLE IF NOT EXISTS gtfs_import_stop_times (trip_id TEXT NOT NULL, stop_sequence INTEGER NOT NULL, station_id TEXT NOT NULL, arrival_seconds INTEGER NOT NULL, departure_seconds INTEGER NOT NULL)")
+            db.execSQL("DELETE FROM connections WHERE id NOT IN (SELECT MIN(id) FROM connections GROUP BY from_id, to_id, line_name)")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_connection_key ON connections(from_id, to_id, line_name)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_timetable_station_time ON timetable(station_id, departure_seconds)")
         }
     }
 
@@ -97,8 +117,9 @@ class RailDatabase(context: Context) :
     fun getTimetable(stationId: String): List<TimetableEntry> {
         val result = mutableListOf<TimetableEntry>()
         readableDatabase.rawQuery(
-            """SELECT id, station_id, line_name, destination, departure_time, arrival_time, service_days
-                FROM timetable WHERE station_id = ? ORDER BY departure_time, id""".trimIndent(),
+            """SELECT id, station_id, line_name, destination, departure_time, arrival_time, service_days,
+                      service_id, departure_seconds, weekday_flags, start_date, end_date
+                FROM timetable WHERE station_id = ? ORDER BY departure_seconds, id""".trimIndent(),
             arrayOf(stationId)
         ).use { cursor ->
             while (cursor.moveToNext()) {
@@ -109,11 +130,49 @@ class RailDatabase(context: Context) :
                     destination = cursor.getString(3),
                     departureTime = cursor.getString(4),
                     arrivalTime = cursor.getString(5),
-                    serviceDays = cursor.getString(6)
+                    serviceDays = cursor.getString(6),
+                    serviceId = cursor.getString(7),
+                    departureSeconds = cursor.getInt(8),
+                    weekdayFlags = cursor.getString(9),
+                    startDate = cursor.getString(10),
+                    endDate = cursor.getString(11)
                 )
             }
         }
         return result
+    }
+
+    /** Filters timetable entries against local weekdays, service periods and GTFS date exceptions. */
+    fun getUpcomingTimetable(
+        stationId: String,
+        date: java.time.LocalDate,
+        afterSeconds: Int,
+        limit: Int = 80
+    ): List<TimetableEntry> {
+        val dateKey = date.format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE)
+        val exceptions = mutableMapOf<String, Int>()
+        readableDatabase.rawQuery(
+            "SELECT service_id, exception_type FROM service_exceptions WHERE service_date = ?",
+            arrayOf(dateKey)
+        ).use { cursor ->
+            while (cursor.moveToNext()) exceptions[cursor.getString(0)] = cursor.getInt(1)
+        }
+        val weekdayIndex = date.dayOfWeek.value - 1
+        return getTimetable(stationId)
+            .asSequence()
+            .filter { it.departureSeconds >= afterSeconds }
+            .filter { entry ->
+                val exception = exceptions[entry.serviceId]
+                if (exception != null) {
+                    exception == 1
+                } else {
+                    dateKey >= entry.startDate &&
+                        dateKey <= entry.endDate &&
+                        entry.weekdayFlags.getOrNull(weekdayIndex) == '1'
+                }
+            }
+            .take(limit)
+            .toList()
     }
 
     fun getDatasetInfo(): DatasetInfo {
@@ -180,7 +239,7 @@ class RailDatabase(context: Context) :
         require(connections.isNotEmpty()) { "connections は1件以上必要です。" }
 
         val timetables = mutableListOf<JSONObject>()
-        val timePattern = Regex("^([01]\\d|2[0-3]):[0-5]\\d$")
+        val timePattern = Regex("^\\d{2,3}:[0-5]\\d$")
         for (i in 0 until timetableArray.length()) {
             val item = timetableArray.getJSONObject(i)
             val stationId = item.optString("stationId").trim()
@@ -196,6 +255,19 @@ class RailDatabase(context: Context) :
             timetables += item
         }
 
+        val exceptionArray = root.optJSONArray("serviceExceptions") ?: JSONArray()
+        val exceptions = mutableListOf<Triple<String, String, Int>>()
+        for (i in 0 until exceptionArray.length()) {
+            val item = exceptionArray.getJSONObject(i)
+            val serviceId = item.optString("serviceId").trim()
+            val date = item.optString("date").trim()
+            val type = item.optInt("exceptionType", 0)
+            require(serviceId.isNotBlank() && date.matches(Regex("^\\d{8}$")) && type in 1..2) {
+                "serviceExceptions の内容が不正です（行: " + (i + 1) + "）。"
+            }
+            exceptions += Triple(serviceId, date, type)
+        }
+
         val datasetName = root.optString("datasetName", "インポートデータ").trim()
             .ifBlank { "インポートデータ" }
         val datasetVersion = root.optString("datasetVersion", "1").trim().ifBlank { "1" }
@@ -203,6 +275,9 @@ class RailDatabase(context: Context) :
         db.beginTransaction()
         try {
             db.delete("timetable", null, null)
+            db.delete("service_calendar", null, null)
+            db.delete("service_exceptions", null, null)
+            db.delete("gtfs_import_stop_times", null, null)
             db.delete("connections", null, null)
             db.delete("stations", null, null)
             db.delete("metadata", null, null)
@@ -216,7 +291,23 @@ class RailDatabase(context: Context) :
                     destination = item.getString("destination"),
                     departure = item.getString("departure"),
                     arrival = item.getString("arrival"),
-                    serviceDays = item.optString("serviceDays", "毎日")
+                    serviceDays = item.optString("serviceDays", "毎日"),
+                    serviceId = item.optString("serviceId", ""),
+                    departureSeconds = item.optInt("departureSeconds", parseTimeSeconds(item.optString("departure"))),
+                    weekdayFlags = item.optString("weekdayFlags", weekdayFlagsFromServiceDays(item.optString("serviceDays", "毎日"))),
+                    startDate = item.optString("startDate", "00000000"),
+                    endDate = item.optString("endDate", "99999999")
+                )
+            }
+            exceptions.forEach { (serviceId, date, type) ->
+                db.insertWithOnConflict(
+                    "service_exceptions", null,
+                    ContentValues().apply {
+                        put("service_id", serviceId)
+                        put("service_date", date)
+                        put("exception_type", type)
+                    },
+                    SQLiteDatabase.CONFLICT_REPLACE
                 )
             }
             writeMeta(db, "dataset_name", datasetName)
@@ -264,12 +355,32 @@ class RailDatabase(context: Context) :
                         .put("departure", entry.departureTime)
                         .put("arrival", entry.arrivalTime)
                         .put("serviceDays", entry.serviceDays)
+                        .put("serviceId", entry.serviceId)
+                        .put("departureSeconds", entry.departureSeconds)
+                        .put("weekdayFlags", entry.weekdayFlags)
+                        .put("startDate", entry.startDate)
+                        .put("endDate", entry.endDate)
+                )
+            }
+        }
+        val exceptionArray = JSONArray()
+        readableDatabase.rawQuery(
+            "SELECT service_id, service_date, exception_type FROM service_exceptions ORDER BY service_date, service_id",
+            null
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                exceptionArray.put(
+                    JSONObject()
+                        .put("serviceId", cursor.getString(0))
+                        .put("date", cursor.getString(1))
+                        .put("exceptionType", cursor.getInt(2))
                 )
             }
         }
         root.put("stations", stationArray)
             .put("connections", connectionArray)
             .put("timetables", timetableArray)
+            .put("serviceExceptions", exceptionArray)
         return root.toString(2)
     }
 
@@ -278,6 +389,9 @@ class RailDatabase(context: Context) :
         db.beginTransaction()
         try {
             db.delete("timetable", null, null)
+            db.delete("service_calendar", null, null)
+            db.delete("service_exceptions", null, null)
+            db.delete("gtfs_import_stop_times", null, null)
             db.delete("connections", null, null)
             db.delete("stations", null, null)
             db.delete("metadata", null, null)
@@ -412,7 +526,7 @@ class RailDatabase(context: Context) :
             if (connection.distanceMeters == null) putNull("distance_meters")
             else put("distance_meters", connection.distanceMeters)
         }
-        db.insertOrThrow("connections", null, values)
+        db.insertWithOnConflict("connections", null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
     private fun insertTimetable(
@@ -422,7 +536,12 @@ class RailDatabase(context: Context) :
         destination: String,
         departure: String,
         arrival: String,
-        serviceDays: String
+        serviceDays: String,
+        serviceId: String = "",
+        departureSeconds: Int = parseTimeSeconds(departure),
+        weekdayFlags: String = weekdayFlagsFromServiceDays(serviceDays),
+        startDate: String = "00000000",
+        endDate: String = "99999999"
     ) {
         val values = ContentValues().apply {
             put("station_id", stationId)
@@ -431,10 +550,35 @@ class RailDatabase(context: Context) :
             put("departure_time", departure)
             put("arrival_time", arrival)
             put("service_days", serviceDays)
+            put("service_id", serviceId)
+            put("departure_seconds", departureSeconds)
+            put("weekday_flags", weekdayFlags)
+            put("start_date", startDate)
+            put("end_date", endDate)
         }
         db.insertOrThrow("timetable", null, values)
     }
 
+    private fun parseTimeSeconds(time: String): Int {
+        val parts = time.split(":")
+        if (parts.size < 2) return 0
+        val hours = parts[0].toIntOrNull() ?: return 0
+        val minutes = parts[1].toIntOrNull() ?: return 0
+        val seconds = parts.getOrNull(2)?.toIntOrNull() ?: 0
+        if (minutes !in 0..59 || seconds !in 0..59) return 0
+        return hours * 3600 + minutes * 60 + seconds
+    }
+
+    private fun weekdayFlagsFromServiceDays(value: String): String = when {
+        value.contains("毎日") -> "1111111"
+        value.contains("平日") -> "1111100"
+        value.contains("土休日") || value.contains("土日祝") -> "0000011"
+        value.contains("土曜") -> "0000010"
+        value.contains("日曜") || value.contains("日祝") -> "0000001"
+        else -> "1111111"
+    }
+
+    private fun writeMeta
     private fun writeMeta(db: SQLiteDatabase, key: String, value: String) {
         db.insertWithOnConflict(
             "metadata",
@@ -459,6 +603,6 @@ class RailDatabase(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "nidamap_offline.db"
-        private const val DATABASE_VERSION = 1
+        private const val DATABASE_VERSION = 2
     }
 }

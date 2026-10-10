@@ -22,7 +22,12 @@ data class TimetableEntry(
     val destination: String,
     val departureTime: String,
     val arrivalTime: String,
-    val serviceDays: String
+    val serviceDays: String,
+    val serviceId: String = "",
+    val departureSeconds: Int = 0,
+    val weekdayFlags: String = "1111111",
+    val startDate: String = "00000000",
+    val endDate: String = "99999999"
 )
 
 data class RouteLeg(
