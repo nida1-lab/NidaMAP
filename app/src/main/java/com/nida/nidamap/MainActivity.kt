@@ -7,6 +7,10 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
 import android.os.Looper
 import android.os.VibrationEffect
@@ -50,6 +54,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -58,6 +63,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.nida.nidamap.data.DatasetInfo
+import com.nida.nidamap.data.GtfsImporter
 import com.nida.nidamap.data.RailDatabase
 import com.nida.nidamap.data.RouteResult
 import com.nida.nidamap.data.Station
@@ -66,6 +72,10 @@ import com.nida.nidamap.routing.RoutePlanner
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.sqrt
 
 private val NidaGreen = Color(0xFF008F62)
 private val Ink = Color(0xFF17211D)
@@ -104,7 +114,9 @@ private fun NidaMapApp() {
     var rideStep by remember { mutableIntStateOf(0) }
     var gpsEnabled by remember { mutableStateOf(false) }
     var gpsStatus by remember { mutableStateOf("乗車ガイドは停止中") }
+    var motionDetected by remember { mutableStateOf(false) }
     var dataStatus by remember { mutableStateOf("データはこの端末内に保存されます。") }
+    val scope = rememberCoroutineScope()
     var confirmReset by remember { mutableStateOf(false) }
 
     fun refreshData() {
@@ -122,16 +134,41 @@ private fun NidaMapApp() {
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val result = runCatching {
-                val text = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
-                    ?: throw IllegalArgumentException("ファイルを読み取れませんでした。")
-                database.importJson(text)
+            dataStatus = "JSONを端末内へ取り込み中…"
+            scope.launch {
+                val result = runCatching {
+                    withContext(Dispatchers.IO) {
+                        val text = context.contentResolver.openInputStream(uri)
+                            ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                            ?: throw IllegalArgumentException("ファイルを読み取れませんでした。")
+                        database.importJson(text)
+                    }
+                }
+                result.onSuccess { summary ->
+                    refreshData()
+                    dataStatus = "JSON取込成功：${summary.datasetName}（駅 ${summary.stationCount}・接続 ${summary.connectionCount}・時刻表 ${summary.timetableCount} 件）"
+                }.onFailure { error ->
+                    dataStatus = "JSON取込失敗：${error.message ?: "ファイル形式を確認してください"}"
+                }
             }
-            result.onSuccess { summary ->
-                refreshData()
-                dataStatus = "取込成功：${summary.datasetName}（駅 ${summary.stationCount}・接続 ${summary.connectionCount}・時刻表 ${summary.timetableCount} 件）"
-            }.onFailure { error ->
-                dataStatus = "取込失敗：${error.message ?: "ファイル形式を確認してください"}"
+        }
+    }
+
+    val gtfsImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            dataStatus = "GTFS ZIPを検証・取り込み中…"
+            scope.launch {
+                val result = runCatching {
+                    withContext(Dispatchers.IO) { GtfsImporter.importZip(context, uri, database) }
+                }
+                result.onSuccess { summary ->
+                    refreshData()
+                    dataStatus = "GTFS取込成功：${summary.datasetName}（駅 ${summary.stationCount}・接続 ${summary.connectionCount}・時刻表 ${summary.timetableCount} 件）"
+                }.onFailure { error ->
+                    dataStatus = "GTFS取込失敗：${error.message ?: "ZIP内容を確認してください"}"
+                }
             }
         }
     }
@@ -140,14 +177,16 @@ private fun NidaMapApp() {
         contract = ActivityResultContracts.CreateDocument("application/json")
     ) { uri ->
         if (uri != null) {
-            runCatching {
-                val json = database.exportJson()
-                context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(json) }
-                    ?: throw IllegalArgumentException("保存先に書き込めませんでした。")
-            }.onSuccess {
-                dataStatus = "JSONを書き出しました。"
-            }.onFailure { error ->
-                dataStatus = "書き出し失敗：${error.message ?: "保存先を確認してください"}"
+            scope.launch {
+                val result = runCatching {
+                    withContext(Dispatchers.IO) {
+                        val json = database.exportJson()
+                        context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(json) }
+                            ?: throw IllegalArgumentException("保存先に書き込めませんでした。")
+                    }
+                }
+                result.onSuccess { dataStatus = "JSONを書き出しました。" }
+                    .onFailure { error -> dataStatus = "書き出し失敗：${error.message ?: "保存先を確認してください"}" }
             }
         }
     }
@@ -327,7 +366,7 @@ private fun NidaMapApp() {
                 1 -> TimetableScreen(
                     stations = stations,
                     dataRevision = dataRevision,
-                    loadTimetable = { database.getTimetable(it) },
+                    loadTimetable = { database.getUpcomingTimetable(it, java.time.LocalDate.now(), LocalTime.now().toSecondOfDay()) },
                     datasetInfo = datasetInfo
                 )
                 2 -> RideScreen(
@@ -361,6 +400,7 @@ private fun NidaMapApp() {
                     message = dataStatus,
                     confirmReset = confirmReset,
                     onImport = { importLauncher.launch(arrayOf("application/json", "text/json", "text/plain")) },
+                    onImportGtfs = { gtfsImportLauncher.launch(arrayOf("*/*")) },
                     onExport = { exportLauncher.launch("nidamap-rail-data.json") },
                     onAskReset = { confirmReset = true },
                     onCancelReset = { confirmReset = false },
@@ -542,13 +582,13 @@ private fun TimetableScreen(
         mutableStateOf(stations.firstOrNull { it.id == "osaka" }?.id ?: stations.firstOrNull()?.id.orEmpty())
     }
     val entries = remember(stationId, dataRevision) { loadTimetable(stationId) }
-    PageHeading("時刻表", "端末内に保存された時刻表を表示します。")
+    PageHeading("時刻表", "今日の現在時刻以降に運行する、端末内の登録便を表示します。")
     StationPicker("駅を選択", stations, stationId) { stationId = it }
     if (datasetInfo.isDemo) {
         InfoCard("架空のテスト時刻", "表示される時刻は画面の動作確認用です。実際の列車時刻・運行状況ではありません。")
     }
     if (entries.isEmpty()) {
-        InfoCard("時刻表データがありません", "［データ］から対応JSONを取り込むと、この駅の時刻表が表示されます。")
+        InfoCard("この後の便がありません", "今日の残り時間に該当する便がないか、サービス日に当てはまる便がありません。GTFS ZIPまたはNidaMAP JSONを確認してください。")
     } else {
         val now = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm", Locale.JAPAN))
         val next = entries.firstOrNull { it.departureTime >= now }
@@ -654,6 +694,7 @@ private fun DataScreen(
     message: String,
     confirmReset: Boolean,
     onImport: () -> Unit,
+    onImportGtfs: () -> Unit,
     onExport: () -> Unit,
     onAskReset: () -> Unit,
     onCancelReset: () -> Unit,
@@ -675,7 +716,8 @@ private fun DataScreen(
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("データの管理", color = Ink, fontWeight = FontWeight.Bold)
-            Button(onClick = onImport, modifier = Modifier.fillMaxWidth()) { Text("JSONデータを取り込む") }
+            Button(onClick = onImportGtfs, modifier = Modifier.fillMaxWidth()) { Text("GTFS ZIP（鉄道時刻表）を取り込む") }
+            OutlinedButton(onClick = onImport, modifier = Modifier.fillMaxWidth()) { Text("NidaMAP JSONを取り込む") }
             OutlinedButton(onClick = onExport, modifier = Modifier.fillMaxWidth()) { Text("現在のデータを書き出す") }
             OutlinedButton(onClick = onAskReset, modifier = Modifier.fillMaxWidth()) { Text("開発用デモに戻す") }
             if (confirmReset) {
