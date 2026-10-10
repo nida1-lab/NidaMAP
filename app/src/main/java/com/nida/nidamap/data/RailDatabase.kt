@@ -578,7 +578,6 @@ class RailDatabase(context: Context) :
         else -> "1111111"
     }
 
-    private fun writeMeta
     private fun writeMeta(db: SQLiteDatabase, key: String, value: String) {
         db.insertWithOnConflict(
             "metadata",
