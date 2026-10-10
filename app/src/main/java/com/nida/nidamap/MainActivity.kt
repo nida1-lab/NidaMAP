@@ -3,7 +3,9 @@ package com.nida.nidamap
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -64,6 +66,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.nida.nidamap.data.DatasetInfo
+import com.nida.nidamap.data.FareEstimate
 import com.nida.nidamap.data.GtfsImporter
 import com.nida.nidamap.data.RailDatabase
 import com.nida.nidamap.data.RouteResult
@@ -122,6 +125,7 @@ private fun NidaMapApp() {
     var gpsEnabled by remember { mutableStateOf(false) }
     var gpsStatus by remember { mutableStateOf("乗車ガイドは停止中") }
     var currentLocation by remember { mutableStateOf<Location?>(null) }
+    var mapFullscreen by remember { mutableStateOf(false) }
     var motionDetected by remember { mutableStateOf(false) }
     var dataStatus by remember { mutableStateOf("データはこの端末内に保存されます。") }
     val scope = rememberCoroutineScope()
@@ -136,6 +140,7 @@ private fun NidaMapApp() {
         rideStep = 0
         gpsEnabled = false
         currentLocation = null
+        mapFullscreen = false
         gpsStatus = "乗車ガイドは停止中"
     }
 
@@ -239,6 +244,9 @@ private fun NidaMapApp() {
     }
 
     val route = searchResult
+    val fareEstimate = remember(searchResult, dataRevision) {
+        searchResult?.let { database.estimateFare(it) }
+    }
     val trackingActive = rideStarted && selectedTab == 2 && gpsEnabled &&
         route != null && rideStep < route.stations.lastIndex
 
@@ -346,31 +354,35 @@ private fun NidaMapApp() {
     val tabs = listOf("経路", "時刻表", "乗車中", "データ")
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("NidaMAP", fontWeight = FontWeight.Bold, color = Ink)
-                        Text(
-                            if (datasetInfo.isDemo) "大阪エリア · デモデータ" else "オフライン鉄道ナビ",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Muted
-                        )
+            if (!(selectedTab == 2 && mapFullscreen)) {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text("NidaMAP", fontWeight = FontWeight.Bold, color = Ink)
+                            Text(
+                                if (datasetInfo.isDemo) "大阪エリア · デモデータ" else "オフライン鉄道ナビ",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Muted
+                            )
+                        }
                     }
-                }
-            )
+                )
+            }
         },
         bottomBar = {
-            NavigationBar(containerColor = Color.White) {
-                tabs.forEachIndexed { index, label ->
-                    NavigationBarItem(
-                        selected = selectedTab == index,
-                        onClick = {
-                            if (index == 2 && searchResult != null && !rideStarted) startRide()
-                            else selectedTab = index
-                        },
-                        icon = { Text(listOf("⇄", "◷", "◎", "▤")[index]) },
-                        label = { Text(label) }
-                    )
+            if (!(selectedTab == 2 && mapFullscreen)) {
+                NavigationBar(containerColor = Color.White) {
+                    tabs.forEachIndexed { index, label ->
+                        NavigationBarItem(
+                            selected = selectedTab == index,
+                            onClick = {
+                                if (index == 2 && searchResult != null && !rideStarted) startRide()
+                                else selectedTab = index
+                            },
+                            icon = { Text(listOf("⇄", "◷", "◎", "▤")[index]) },
+                            label = { Text(label) }
+                        )
+                    }
                 }
             }
         },
@@ -379,16 +391,22 @@ private fun NidaMapApp() {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 18.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+                .then(
+                    if (selectedTab == 2 && mapFullscreen) Modifier
+                    else Modifier
+                        .padding(padding)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 18.dp, vertical = 12.dp)
+                ),
+            verticalArrangement = if (selectedTab == 2 && mapFullscreen) Arrangement.spacedBy(0.dp)
+                else Arrangement.spacedBy(14.dp)
         ) {
             when (selectedTab) {
                 0 -> RouteSearchScreen(
                     stations = stations,
                     result = searchResult,
                     datasetInfo = datasetInfo,
+                    fareEstimate = fareEstimate,
                     onSearch = { startId, goalId ->
                         val found = RoutePlanner.findRoute(
                             stations,
@@ -418,6 +436,8 @@ private fun NidaMapApp() {
                     currentStep = rideStep,
                     gpsStatus = gpsStatus,
                     motionDetected = motionDetected,
+                    mapFullscreen = mapFullscreen,
+                    onToggleMapFullscreen = { mapFullscreen = !mapFullscreen },
                     onStart = { startRide() },
                     onNext = {
                         val max = searchResult?.stations?.lastIndex ?: 0
@@ -471,9 +491,11 @@ private fun RouteSearchScreen(
     stations: List<Station>,
     result: RouteResult?,
     datasetInfo: DatasetInfo,
+    fareEstimate: FareEstimate?,
     onSearch: (String, String) -> Unit,
     onStartRide: () -> Unit
 ) {
+    val context = LocalContext.current
     var startId by remember(stations) {
         mutableStateOf(stations.firstOrNull { it.id == "osaka" }?.id ?: stations.firstOrNull()?.id.orEmpty())
     }
@@ -483,7 +505,11 @@ private fun RouteSearchScreen(
     var error by remember { mutableStateOf<String?>(null) }
 
     Text("どこへ行きますか？", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Ink)
-    Text("オフラインの駅データを使って経路を計算します。", color = Muted)
+    Text(
+        if (datasetInfo.isDemo) "オフラインで経路計算します。現在の駅・路線・料金は開発用データです。"
+        else "取り込んだ鉄道データから経路を検索します。運賃はGTFSに料金定義がある場合のみ表示します。",
+        color = Muted
+    )
     if (datasetInfo.isDemo) {
         InfoCard("開発用データ", "路線接続・所要時間は実運行用ではありません。駅検索、経路計算、乗車ガイドの動作確認用です。")
     }
@@ -538,6 +564,48 @@ private fun RouteSearchScreen(
                     color = Muted,
                     style = MaterialTheme.typography.bodySmall
                 )
+                if (result.legs.isNotEmpty()) {
+                    when {
+                        fareEstimate == null -> Text(
+                            "運賃：未算出（このデータセットに対応する運賃定義がありません）",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        fareEstimate.isComplete -> Text(
+                            "参考運賃 ¥${fareEstimate.totalYen} · GTFS運賃定義から計算",
+                            color = NidaGreen,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        else -> Text(
+                            "確認できた運賃 ¥${fareEstimate.totalYen}（${fareEstimate.coveredSegments}/${fareEstimate.totalSegments} 区間。全額ではありません）",
+                            color = Color(0xFF9A5B00),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    if (result.legs.any {
+                            it.lineName.contains("Osaka Metro", ignoreCase = true) ||
+                                it.lineName.contains("大阪メトロ") ||
+                                it.lineName.contains("御堂筋") ||
+                                it.lineName.contains("ニュートラム")
+                        }) {
+                        Text(
+                            "Osaka Metro公式の運賃表を開く ↗",
+                            modifier = Modifier.clickable {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(
+                                            Intent.ACTION_VIEW,
+                                            Uri.parse("https://subway.osakametro.co.jp/guide/fare/fare/price.php")
+                                        )
+                                    )
+                                }
+                            }.padding(vertical = 4.dp),
+                            color = NidaGreen,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
                 result.stations.forEachIndexed { index, station ->
                     Row(Modifier.fillMaxWidth()) {
                         Column(Modifier.width(26.dp), horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
@@ -559,7 +627,12 @@ private fun RouteSearchScreen(
                 Button(onClick = onStartRide, modifier = Modifier.fillMaxWidth()) {
                     Text("この経路で乗車ガイドを開始")
                 }
-                Text("所要時間は接続データに基づく推定値です。実際の時刻表・運行状況ではありません。", color = Muted, style = MaterialTheme.typography.bodySmall)
+                Text(
+                    if (datasetInfo.isDemo) "現在は動作確認用の架空データです。実際の移動には使わないでください。"
+                    else "所要時間は駅間接続データからの推定で、発車時刻ごとの待ち時間・リアルタイム運行・複雑な乗継割引は未反映です。",
+                    color = Muted,
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
     }
@@ -673,6 +746,8 @@ private fun RideScreen(
     currentStep: Int,
     gpsStatus: String,
     motionDetected: Boolean,
+    mapFullscreen: Boolean,
+    onToggleMapFullscreen: () -> Unit,
     onStart: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
@@ -685,10 +760,22 @@ private fun RideScreen(
     }
     val boundedStep = currentStep.coerceIn(0, route.stations.lastIndex)
     val current = route.stations[boundedStep]
+    if (mapFullscreen) {
+        RideMapView(
+            route = route,
+            currentStep = boundedStep,
+            currentLocation = currentLocation,
+            mapFullscreen = true,
+            onToggleMapFullscreen = onToggleMapFullscreen
+        )
+        return
+    }
     RideMapView(
         route = route,
         currentStep = boundedStep,
-        currentLocation = currentLocation
+        currentLocation = currentLocation,
+        mapFullscreen = false,
+        onToggleMapFullscreen = onToggleMapFullscreen
     )
     val next = route.stations.getOrNull(boundedStep + 1)
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -749,7 +836,9 @@ private fun RideScreen(
 private fun RideMapView(
     route: RouteResult,
     currentStep: Int,
-    currentLocation: Location?
+    currentLocation: Location?,
+    mapFullscreen: Boolean,
+    onToggleMapFullscreen: () -> Unit
 ) {
     val context = LocalContext.current
     val mapView = remember(context) {
@@ -761,6 +850,7 @@ private fun RideMapView(
             controller.setZoom(13.5)
         }
     }
+    var lastFocusKey by remember(mapView) { mutableStateOf("") }
     DisposableEffect(mapView) {
         mapView.onResume()
         onDispose {
@@ -769,103 +859,136 @@ private fun RideMapView(
         }
     }
 
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color.White)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
+    Column(
+        modifier = if (mapFullscreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        if (!mapFullscreen) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("現在地", color = Muted, style = MaterialTheme.typography.labelSmall)
-                    Text(
-                        currentLocation?.let { "取得済み · 精度 約${it.accuracy.toInt()}m" } ?: "位置情報を取得中…",
-                        color = Ink,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-                Column(horizontalAlignment = androidx.compose.ui.Alignment.End) {
-                    Text("目的地", color = Muted, style = MaterialTheme.typography.labelSmall)
-                    Text(route.stations.last().name, color = NidaGreen, fontWeight = FontWeight.Bold)
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("現在地", color = Muted, style = MaterialTheme.typography.labelSmall)
+                        Text(
+                            currentLocation?.let { "取得済み · 精度 約${it.accuracy.toInt()}m" } ?: "位置情報を取得中…",
+                            color = Ink,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Column(horizontalAlignment = androidx.compose.ui.Alignment.End) {
+                        Text("目的地", color = Muted, style = MaterialTheme.typography.labelSmall)
+                        Text(route.stations.last().name, color = NidaGreen, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
         }
-        AndroidView(
-            factory = { mapView },
-            modifier = Modifier.fillMaxWidth().height(380.dp),
-            update = { map ->
-                map.overlays.removeAll { it is Marker || it is Polyline }
-                val stationPoints = route.stations.mapNotNull { station ->
-                    val lat = station.latitude
-                    val lon = station.longitude
-                    if (lat != null && lon != null && lat in -90.0..90.0 && lon in -180.0..180.0) {
-                        GeoPoint(lat, lon)
-                    } else null
-                }
-                if (stationPoints.size >= 2) {
-                    val routeLine = Polyline().apply {
-                        setPoints(stationPoints)
-                        outlinePaint.color = android.graphics.Color.rgb(0, 143, 98)
-                        outlinePaint.strokeWidth = 9f
+        Box(
+            modifier = if (mapFullscreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().height(380.dp)
+        ) {
+            AndroidView(
+                factory = { mapView },
+                modifier = Modifier.fillMaxSize(),
+                update = { map ->
+                    map.overlays.removeAll { it is Marker || it is Polyline }
+                    val stationPoints = route.stations.mapNotNull { station ->
+                        val lat = station.latitude
+                        val lon = station.longitude
+                        if (lat != null && lon != null && lat in -90.0..90.0 && lon in -180.0..180.0) GeoPoint(lat, lon) else null
                     }
-                    map.overlays.add(routeLine)
-                }
-                route.stations.forEachIndexed { index, station ->
-                    val lat = station.latitude
-                    val lon = station.longitude
-                    if (lat != null && lon != null && lat in -90.0..90.0 && lon in -180.0..180.0) {
-                        val point = GeoPoint(lat, lon)
-                        val marker = Marker(map).apply {
-                            position = point
-                            title = station.name
-                            snippet = when (index) {
-                                0 -> "出発駅"
-                                route.stations.lastIndex -> "目的地"
-                                currentStep -> "現在の案内駅"
-                                else -> "経由駅"
-                            }
-                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    if (stationPoints.size >= 2) {
+                        val routeLine = Polyline().apply {
+                            setPoints(stationPoints)
+                            outlinePaint.color = android.graphics.Color.rgb(0, 143, 98)
+                            outlinePaint.strokeWidth = 9f
                         }
-                        map.overlays.add(marker)
+                        map.overlays.add(routeLine)
+                    }
+                    route.stations.forEachIndexed { index, station ->
+                        val lat = station.latitude
+                        val lon = station.longitude
+                        if (lat != null && lon != null && lat in -90.0..90.0 && lon in -180.0..180.0) {
+                            val marker = Marker(map).apply {
+                                position = GeoPoint(lat, lon)
+                                title = station.name
+                                snippet = when (index) {
+                                    0 -> "出発駅"
+                                    route.stations.lastIndex -> "目的地"
+                                    currentStep -> "現在の案内駅"
+                                    else -> "経由駅"
+                                }
+                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                            }
+                            map.overlays.add(marker)
+                        }
+                    }
+                    currentLocation?.let { location ->
+                        map.overlays.add(Marker(map).apply {
+                            position = GeoPoint(location.latitude, location.longitude)
+                            title = "現在地"
+                            snippet = "GPS精度 約${location.accuracy.toInt()}m"
+                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                        })
+                    }
+                    // Avoid resetting a manually chosen zoom on each GPS fix.
+                    val focusKey = "${route.stations.firstOrNull()?.id}:${route.stations.lastOrNull()?.id}:$currentStep"
+                    if (focusKey != lastFocusKey) {
+                        val center = currentLocation?.let { GeoPoint(it.latitude, it.longitude) }
+                            ?: route.stations.getOrNull(currentStep)?.let { station ->
+                                if (station.latitude != null && station.longitude != null) GeoPoint(station.latitude, station.longitude) else null
+                            }
+                            ?: stationPoints.firstOrNull()
+                            ?: GeoPoint(34.6937, 135.5023)
+                        map.controller.setCenter(center)
+                        map.controller.setZoom(if (currentLocation == null) 13.5 else 15.0)
+                        lastFocusKey = focusKey
+                    }
+                    map.invalidate()
+                }
+            )
+            if (mapFullscreen) {
+                Card(
+                    modifier = Modifier.align(androidx.compose.ui.Alignment.TopStart).padding(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.94f))
+                ) {
+                    Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                        Text(
+                            currentLocation?.let { "現在地 · 精度 約${it.accuracy.toInt()}m" } ?: "現在地を取得中…",
+                            color = Ink,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text("目的地 · ${route.stations.last().name}", color = NidaGreen, fontWeight = FontWeight.Bold)
                     }
                 }
-                currentLocation?.let { location ->
-                    val here = GeoPoint(location.latitude, location.longitude)
-                    map.overlays.add(Marker(map).apply {
-                        position = here
-                        title = "現在地"
-                        snippet = "GPS精度 約${location.accuracy.toInt()}m"
-                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                    })
-                }
-                val center = currentLocation?.let { GeoPoint(it.latitude, it.longitude) }
-                    ?: route.stations.getOrNull(currentStep)?.let { station ->
-                        if (station.latitude != null && station.longitude != null) GeoPoint(station.latitude, station.longitude) else null
-                    }
-                    ?: stationPoints.firstOrNull()
-                    ?: GeoPoint(34.6937, 135.5023)
-                map.controller.setCenter(center)
-                map.controller.setZoom(if (currentLocation == null) 13.5 else 15.0)
-                map.invalidate()
             }
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(
-                onClick = { mapView.controller.zoomOut() },
-                modifier = Modifier.weight(1f)
-            ) { Text("− 縮小") }
-            OutlinedButton(
-                onClick = { mapView.controller.zoomIn() },
-                modifier = Modifier.weight(1f)
-            ) { Text("+ 拡大") }
+            Card(
+                modifier = Modifier.align(androidx.compose.ui.Alignment.BottomStart).padding(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.96f))
+            ) {
+                Column(
+                    modifier = Modifier.padding(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+                ) {
+                    OutlinedButton(onClick = { mapView.controller.zoomIn() }, modifier = Modifier.width(58.dp)) { Text("+") }
+                    OutlinedButton(onClick = { mapView.controller.zoomOut() }, modifier = Modifier.width(58.dp)) { Text("−") }
+                    OutlinedButton(onClick = onToggleMapFullscreen, modifier = Modifier.width(74.dp)) {
+                        Text(if (mapFullscreen) "戻る" else "全画面")
+                    }
+                }
+            }
         }
-        Text(
-            "地図：OpenStreetMap · 経路線は駅座標を結んだ概略表示です。地図タイルの初回表示には通信が必要です。",
-            color = Muted,
-            style = MaterialTheme.typography.bodySmall
-        )
+        if (!mapFullscreen) {
+            Text(
+                "地図：OpenStreetMap · 経路線は駅座標を結んだ概略表示です。地図タイルの初回表示には通信が必要です。",
+                color = Muted,
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
     }
 }
 

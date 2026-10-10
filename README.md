@@ -6,10 +6,11 @@ NidaMAP is an Android-first, offline-first railway navigation app prototype, sta
 
 - Offline route search over a local station/connection graph, with estimated transfer costs.
 - SQLite storage for stations, inter-station connections, timetables, dataset metadata and GTFS service-day exceptions.
-- On-device import of GTFS static ZIP feeds (stops, routes, trips, stop_times, calendar and calendar_dates).
-- Import/export of the NidaMAP JSON format for backups and smaller custom datasets.
+- On-device import of GTFS static ZIP feeds (stops, routes, trips, stop_times, calendar and calendar_dates), including fare zones and legacy GTFS Fares V1 fare_attributes.txt / fare_rules.txt when supplied.
+- Route fares are calculated only when matching JPY fare rules are included in the feed. If fare data is missing, NidaMAP explicitly shows that the fare is unavailable instead of inventing an amount. Complex transfer discounts and modern GTFS Fares V2 are not fully modelled.
+- Import/export of NidaMAP JSON backups preserves route IDs but does not export GTFS fare tables.
 - Timetable filtering for current local time, weekday/service date range and GTFS date exceptions.
-- Ride guide with an OpenStreetMap base map, current-location and destination markers, station markers, a schematic route line, GPS proximity checks when imported station coordinates are available, accelerometer motion indication, vibration, and manual previous/next correction.
+- Ride guide with an OpenStreetMap base map, current-location and destination markers, station markers, a schematic route line, lower-left zoom controls and an in-app full-screen map toggle, GPS proximity checks when imported station coordinates are available, accelerometer motion indication, vibration, and manual previous/next correction.
 - Route search, timetable storage and GPS processing remain on-device. OpenStreetMap map tiles are downloaded over the Internet and may be cached by the map library.
 
 ## Important data and safety notes
