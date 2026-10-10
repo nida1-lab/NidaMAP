@@ -364,7 +364,10 @@ private fun NidaMapApp() {
                 tabs.forEachIndexed { index, label ->
                     NavigationBarItem(
                         selected = selectedTab == index,
-                        onClick = { selectedTab = index },
+                        onClick = {
+                            if (index == 2 && searchResult != null && !rideStarted) startRide()
+                            else selectedTab = index
+                        },
                         icon = { Text(listOf("⇄", "◷", "◎", "▤")[index]) },
                         label = { Text(label) }
                     )
